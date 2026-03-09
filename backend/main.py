@@ -1,23 +1,24 @@
+
 from typing import Optional
 
+import asyncio
 import os
-import shutil
+import re
 import tempfile
-import subprocess
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 import logging
 
 
 logger = logging.getLogger("backend")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
 
-app = FastAPI()
+app = FastAPI(title="AI Review Assistant - Backend")
 
 # Allow frontend access (for local dev only)
 app.add_middleware(
@@ -35,41 +36,46 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-coder")
 
 
 class CodeRequest(BaseModel):
-    code: str
-    language: Optional[str] = ""
+    code: str = Field(..., min_length=1, max_length=20000, description="Source code to analyze")
+    language: Optional[str] = Field("", max_length=64, description="Programming language name")
 
 
-async def ask_ai(prompt: str, timeout: int = 10) -> str:
+async def ask_ai(prompt: str, timeout: int = 10, retries: int = 3) -> str:
     """Send prompt to the local Ollama (or compatible) API and return text.
 
-    Uses httpx AsyncClient with a timeout and basic error handling.
+    Will retry a few times with exponential backoff on transient errors.
     """
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                OLLAMA_URL,
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    attempt = 0
+    backoff = 0.5
+    while attempt < retries:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    OLLAMA_URL,
+                    json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
-            # Ollama-style response may vary; try common keys
-            if isinstance(data, dict):
-                for key in ("response", "text", "output"):
-                    if key in data:
-                        return data[key]
+                # Ollama-style response may vary; try common keys
+                if isinstance(data, dict):
+                    for key in ("response", "text", "output"):
+                        if key in data and data[key] is not None:
+                            return str(data[key])
 
-            # fallback to raw text
-            if isinstance(data, str):
-                return data
+                # fallback to raw text
+                if isinstance(data, str):
+                    return data
 
-            return ""
-    except httpx.RequestError as e:
-        logger.exception("AI request failed")
-        raise HTTPException(status_code=502, detail=f"AI request failed: {e}")
-    except httpx.HTTPStatusError as e:
-        logger.exception("AI returned error status")
-        raise HTTPException(status_code=502, detail=f"AI returned error: {e.response.text}")
+                return ""
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            logger.warning("AI call failed on attempt %s: %s", attempt + 1, e)
+            attempt += 1
+            if attempt >= retries:
+                logger.exception("AI request failed after retries")
+                raise HTTPException(status_code=502, detail=f"AI request failed: {e}")
+            await asyncio.sleep(backoff)
+            backoff *= 2
 
 
 # -----------------------------
@@ -161,6 +167,24 @@ Provide a clear and helpful answer.
 class RepoRequest(BaseModel):
     repo_url: str
 
+    @validator("repo_url")
+    def validate_repo_url(cls, v: str) -> str:
+        # Allow http(s), git@ and git:// urls for common git providers
+        if not re.match(r"^(https?://|git@|git://)", v):
+            raise ValueError("repo_url must start with http(s)://, git@ or git://")
+        return v
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Health check endpoint."""
+    return {"status": "ok"}
+
+
+@app.get("/")
+async def root() -> dict:
+    return {"service": "ai-review-backend", "status": "running"}
+
 
 def _is_text_file(path: Path) -> bool:
     try:
@@ -179,16 +203,24 @@ async def analyze_repo(request: RepoRequest):
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             # --depth 1 reduces clone time and size
-            subprocess.run(
-                ["git", "clone", "--depth", "1", request.repo_url, tmpdir],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                request.repo_url,
+                tmpdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except subprocess.CalledProcessError as e:
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                stderr_text = stderr.decode("utf-8", errors="ignore")
+                logger.error("git clone failed: %s", stderr_text)
+                raise HTTPException(status_code=400, detail=f"git clone failed: {stderr_text}")
+        except Exception as e:
             logger.exception("git clone failed")
-            raise HTTPException(status_code=400, detail=f"git clone failed: {e.stderr}")
+            raise HTTPException(status_code=400, detail=f"git clone failed: {e}")
 
         code_snippets = []
         total_len = 0
